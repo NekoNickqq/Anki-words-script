@@ -64,3 +64,45 @@ python reverso_anki.py run --ai                   # добавить поясн�
 `ai_summarize_translation()` — готовое место для LLM: выбор лучшего значения,
 генерация подсказок, переформулирование примеров, Cloze-карточки и т.д.
  
+
+## Виртуальное окружение (venv)
+
+Venv не обязателен, но **настоятельно рекомендуется**, чтобы не засорять системный Python.
+В Windows есть нюанс: в Anaconda/Microsoft Store Python `pip` без venv может ставить пакеты
+в окружениеconda, а не в тот интерпретатор, которым вы запускаете скрипт.
+
+```bash
+# 1) создать venv (выполнять из папки проекта)
+python -m venv .venv            # Windows: py -m venv .venv
+
+# 2) активировать
+#    Windows PowerShell :  .venv\Scripts\Activate.ps1
+#    Windows cmd        :  .venv\Scripts\activate.bat
+#    Linux/macOS        :  source .venv/bin/activate
+
+# 3) установить зависимости (после активации pip уже указывает в venv)
+pip install -r requirements.txt
+
+# 4) проверить, что всё установлено в venv
+python -c "import requests, bs4, cloudscraper; print('OK')"
+```
+
+## Как проверить, скачивается ли страница Reverso
+
+Встроенная диагностика — флаг `--check`:
+
+```bash
+python reverso_anki.py --check run
+```
+
+Он по очереди пробует обычный `requests`, затем `cloudscraper`
+(и `cloudscraper + REVERSO_COOKIES`, если переменная задана), печатает HTTP-статусы
+и вердикт: «страница скачивается» или «заблокировано Cloudflare» с инструкцией.
+
+Быстрая проверка одной командой без скрипта:
+
+```bash
+curl -sI https://context.reverso.net/translation/english-russian/run | head -5
+# 200 OK   — страница отдаётся
+# 403/503 + «Just a moment» — блокировка Cloudflare
+```
