@@ -133,6 +133,71 @@ def fetch(url: str) -> str:
     return resp.text
 
 
+def check_download(word: str = "run", url: Optional[str] = None) -> int:
+    """Диагностика: реально ли скачивается страница Reverso.
+
+    Пробует обычный requests, затем cloudscraper (и cookies из REVERSO_COOKIES);
+    печатает статус, фрагмент HTML и явный вердикт: страница получена
+    ИЛИ заблокирована Cloudflare. Возвращает 0 если успех, 1 если блокировка.
+    """
+    if url is None:
+        url = f"{BASE_URL}/translation/{LANG_PAIR}/{word.replace(' ', '%20')}"
+    print(f"Тестируем загрузка: {url}\n")
+    attempts: list[tuple[str, requests.Session]] = []
+    try:
+        s = requests.Session()
+        s.headers.update(_HEADERS)
+        attempts.append(("requests", s))
+    except Exception as e:  # pragma: no cover
+        print("requests недоступен:", e)
+    if cloudscraper is not None:
+        try:
+            attempts.append(("cloudscraper", cloudscraper.create_scraper()))
+        except Exception as e:
+            print("cloudscraper не инициализировался:", e)
+    # третий вариант: cloudscraper + cookies из REVERSO_COOKIES (если заданы)
+    if os.environ.get("REVERSO_COOKIES", "").strip():
+        try:
+            s3 = cloudscraper.create_scraper() if cloudscraper is not None else requests.Session()
+            s3.headers.update(_HEADERS)
+            apply_cookies_from_env(s3)
+            attempts.append(("cookies+cf", s3))
+        except Exception as e:
+            print("не удалось применить cookies:", e)
+
+    for name, sess in attempts:
+        try:
+            resp = sess.get(url, timeout=30)
+        except Exception as e:
+            print(f"[{name:>12}] ОШИБКА сети: {type(e).__name__}: {e}")
+            continue
+        text_head = resp.text[:600]
+        blocked = (
+            resp.status_code in (403, 503)
+            or "Just a moment" in text_head
+            or "cf-browser-verification" in text_head
+            or "Attention Required! | Cloudflare" in text_head
+        )
+        has_content = "translation" in resp.text and ("examples" in resp.text or "result" in resp.text)
+        status = "ЗАБЛОКИРОВАНО (Cloudflare)" if blocked else ("OK — контент найден" if has_content else "Странная страница")
+        print(f"[{name:>12}] HTTP {resp.status_code} | длина {len(resp.text)} симв. | {status}")
+        if not blocked and has_content:
+            snippet = _clean(resp.text)[:200]
+            print(f"\nФрагмент страницы: {snippet}...")
+            print("\nВывод: страница скачивается, скрипт может работать.")
+            return 0
+    print(
+        "\nВывод: страница НЕ скачивается (Cloudflare).\n"
+        "Что сделать:\n"
+        "  1) Убедиться, что cloudscraper установлен: pip install cloudscraper\n"
+        "  2) Открыть https://context.reverso.net в браузере, пройти проверку,\n"
+        "     скопировать cookies (cf_clearance и др.) и запустить так:\n"
+        "       REVERSO_COOKIES='cf_clearance=...; ...' python reverso_anki.py run\n"
+        "  3) Либо использовать прокси/браузерный рендеринг (FlareSolverr, Playwright)."
+    )
+    return 1
+
+
 def apply_cookies_from_env(session: requests.Session) -> None:
     raw = os.environ.get("REVERSO_COOKIES", "").strip()
     if not raw:
@@ -397,7 +462,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--tags", nargs="*", default=[], help="теги для карточек")
     ap.add_argument("--ai", action="store_true", help="добавить пояснения нейросети (OPENAI_API_KEY)")
     ap.add_argument("--dry-run", action="store_true", help="не отправлять в Anki, только показать HTML")
+    ap.add_argument("--check", action="store_true",
+                    help="диагностика: проверить, скачивается ли страница Reverso (и завершиться)")
     args = ap.parse_args(argv)
+
+    if args.check:
+        return check_download(word=(args.words[0] if args.words else "run"))
 
     words = list(args.words)
     if args.file:
