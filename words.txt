@@ -1,4 +1,5 @@
-# список слов, по одному в строке
-run
-house
-take over
+# список слов; опционально: слово<TAB>часть речи (noun/verb/adjective/adverb/participle)
+commitment	noun
+pressure	noun
+within	adverb
+take over	verb
