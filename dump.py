@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-dump_page.py — скачивает HTML-страницу Reverso для указанного слова,
-чтобы потом можно было изучить её структуру и починить парсер.
+dump.py — скачивает HTML-страницу (слово или произвольный URL) и сохраняет её в папку dumps/.
 
 Использование:
-    python dump_page.py terrifying
-    python dump_page.py "take over"
-    python dump_page.py terrifying --out mypage.html
+    python dump.py terrifying
+    python dump.py "https://context.reverso.net/translation/english-russian/run"
+    python dump.py terrifying --out mypage.html
 """
-
 import argparse
 import sys
+from pathlib import Path
 from urllib.parse import quote
+import re
 
 BASE = "https://context.reverso.net"
 HEADERS = {
@@ -23,7 +23,6 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
 }
 
-
 def try_cloudscraper(url):
     try:
         import cloudscraper
@@ -33,22 +32,18 @@ def try_cloudscraper(url):
     try:
         s = cloudscraper.create_scraper()
         s.headers.update(HEADERS)
-        r = s.get(url, timeout=60)
-        return r
+        return s.get(url, timeout=60)
     except Exception as e:
         print(f"[cloudscraper] ошибка: {type(e).__name__}: {e}")
         return None
 
-
 def try_requests(url):
     import requests
     try:
-        r = requests.get(url, headers=HEADERS, timeout=60)
-        return r
+        return requests.get(url, headers=HEADERS, timeout=60)
     except Exception as e:
         print(f"[requests] ошибка: {type(e).__name__}: {e}")
         return None
-
 
 def looks_blocked(text):
     head = text[:2000]
@@ -59,14 +54,18 @@ def looks_blocked(text):
         or "Enable JavaScript and cookies to continue" in head
     )
 
-
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("word", help="слово или фраза на английском")
-    ap.add_argument("--out", default="page.html", help="куда сохранить (по умолчанию page.html)")
+    ap.add_argument("target", help="Слово или полная ссылка (URL)")
+    ap.add_argument("--out", help="Имя файла (по умолчанию генерируется из URL)")
     args = ap.parse_args()
 
-    url = f"{BASE}/translation/english-russian/{quote(args.word.strip())}"
+    # Определяем, что ввел пользователь
+    if args.target.startswith("http"):
+        url = args.target
+    else:
+        url = f"{BASE}/translation/english-russian/{quote(args.target.strip())}"
+
     print(f"URL: {url}\n")
 
     resp = None
@@ -84,19 +83,28 @@ def main():
         resp = None
 
     if resp is None:
-        print("\n✘ Не удалось получить страницу. Возможные причины:")
-        print("  - блокировка Cloudflare (попробуй pip install cloudscraper)")
-        print("  - сеть/провайдер/VPN")
-        print("  - неверное слово")
+        print("\n✘ Не удалось получить страницу.")
         return 1
 
-    with open(args.out, "w", encoding="utf-8") as fh:
+    # Создаем папку dumps, если её нет
+    dumps_dir = Path(__file__).resolve().parent / "dumps"
+    dumps_dir.mkdir(exist_ok=True)
+
+    # Генерируем имя файла
+    if args.out:
+        filename = args.out
+    else:
+        # Берем последнюю часть URL и делаем её безопасной для файловой системы
+        safe_name = re.sub(r'[^\w\-]', '_', url.split("/")[-1] or "index")
+        filename = f"{safe_name}.html"
+
+    out_path = dumps_dir / filename
+
+    with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(resp.text)
 
-    print(f"\n✔ Сохранено в {args.out} ({len(resp.text)} символов)")
-   
+    print(f"\n✔ Сохранено в {out_path.relative_to(Path.cwd())} ({len(resp.text)} символов)")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
