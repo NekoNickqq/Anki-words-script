@@ -1,4 +1,4 @@
-# jos.py
+# anki.py
 import argparse
 import html
 import json
@@ -31,6 +31,7 @@ def log(msg, level="info"):
             f.write(f"{datetime.now().isoformat()} {line}\n")
 
 # --- AI и Ollama ---
+# (функции _ollama_chat, ai_generate_examples, ai_verify_pair, save_bad_example, enrich_with_ai остаются без изменений)
 def _ollama_chat(model, messages, schema, url):
     payload = {"model": model, "messages": messages, "stream": False, "format": schema, "options": {"temperature": 0.7}}
     try:
@@ -101,17 +102,32 @@ def front_label(card):
     if card.pos in ("adjective", "adverb", "participle"): return f"{w} as {card.pos}"
     return w
 
+def get_rarity_tildes(freq: Optional[int]) -> str:
+    if not freq: return ""
+    if freq < 100: return "~~~"
+    if freq < 300: return "~~"
+    if freq < 800: return "~"
+    return ""
+
+def _make_flexible_pattern(form: str) -> str:
+    parts = []
+    for ch in form:
+        if ch in ("е", "ё", "Е", "Ё"):
+            parts.append("[еёЕЁ]")
+        else:
+            parts.append(re.escape(html.escape(ch)))
+    return "".join(parts)
+
 def highlight_word(sentence, target, extra_forms=None):
     esc = html.escape(sentence)
     if not target: return grey_span(esc)
-    
     all_forms = [target] + (extra_forms or [])
     for form in set(all_forms):
-        m = re.search(r"(?<![A-Za-zА-Яа-яЁё'’\-])" + re.escape(html.escape(form)) + r"(?![A-Za-zА-Яа-яЁё'’\-])", esc, re.IGNORECASE)
+        if not form: continue
+        pattern = _make_flexible_pattern(form)
+        m = re.search(r"(?<![A-Za-zА-Яа-яЁё'’\-])" + pattern + r"(?![A-Za-zА-Яа-яЁё'’\-])", esc, re.IGNORECASE)
         if m:
-            before = esc[:m.start()]
-            hit = m.group(0)
-            after = esc[m.end():]
+            before, hit, after = esc[:m.start()], m.group(0), esc[m.end():]
             parts = []
             if before: parts.append(grey_span(before))
             parts.append(hit)
@@ -119,9 +135,22 @@ def highlight_word(sentence, target, extra_forms=None):
             return "".join(parts)
     return grey_span(esc)
 
-def build_front_back(card):
+def build_front_back(card: WordCard) -> tuple[str, str]:
     label = front_label(card)
-    front_first = f"{label}&nbsp;{grey_span(html.escape(card.transcription))}" if card.transcription else label
+    
+    tildes = get_rarity_tildes(card.word_frequency)
+    
+    # Собираем все "серые" элементы после слова
+    grey_parts = []
+    if card.transcription:
+        grey_parts.append(html.escape(card.transcription))
+    if tildes:
+        grey_parts.append(tildes)
+    
+    if grey_parts:
+        front_first = f"{label}&nbsp;{grey_span('&nbsp;'.join(grey_parts))}"
+    else:
+        front_first = label
 
     bold, plain, grey = [], [], []
     for e in card.entries:
@@ -149,14 +178,54 @@ def send_to_anki(front, back, deck, model, tags):
     if res.get("error"): raise RuntimeError(res["error"])
     return res
 
+def process_word(word, args) -> bool:
+    """Обрабатывает одно слово. Возвращает True при успехе."""
+    log(f"[1/3] Получаем данные для «{word}»...")
+    try:
+        card = get_word_data(word, target_pos=args.pos or "", include_blocked=args.include_blocked)
+    except Exception as e:
+        log(f"Ошибка парсинга: {e}", "error")
+        return False
+
+    if not card.entries:
+        log("Переводы не найдены.", "error")
+        return False
+
+    if args.pos:
+        card.pos = args.pos
+
+    if args.ai:
+        log(f"[2/3] AI (Ollama: {args.ai_model})...")
+        enrich_with_ai(card, args.examples, args.ai_model, args.ai_url, verify=not args.no_verify, ai_only=args.ai_only)
+
+    front, back = build_front_back(card)
+    
+    if args.dry_run:
+        print("=" * 60)
+        print("FRONT:", front)
+        print("-" * 60)
+        print("BACK :", back)
+        print("=" * 60)
+        return True
+    else:
+        log("[3/3] Отправка в Anki...")
+        try:
+            res = send_to_anki(front, back, args.deck, args.model, [])
+            log(f"✔ Добавлено (ID: {res['result']})")
+            return True
+        except Exception as e:
+            log(f"✘ Ошибка Anki: {e}", "error")
+            return False
+
 def main():
     global _log_file
     ap = argparse.ArgumentParser()
     ap.add_argument("words", nargs="*")
+    ap.add_argument("--file", help="txt файл со словами (по одному в строке)")
     ap.add_argument("--pos", help="Часть речи (noun, verb, adjective...)")
     ap.add_argument("--deck", default="Reverso EN-RU")
-    ap.add_argument("--model", default="Простая", help="Тип заметки в Anki (по умолчанию 'Простая')")
-    ap.add_argument("--examples", type=int, default=3)
+    ap.add_argument("--model", default="Простая", help="Тип заметки в Anki")
+    ap.add_argument("--examples", type=int, default=1)
     ap.add_argument("--include-blocked", action="store_true")
     ap.add_argument("--ai", action="store_true")
     ap.add_argument("--ai-model", default=OLLAMA_DEFAULT_MODEL)
@@ -173,52 +242,36 @@ def main():
         _log_file.parent.mkdir(parents=True, exist_ok=True)
         _log_file.write_text("", encoding="utf-8")
 
-    if not args.words:
-        print("Укажите слово.")
+    words_to_process = []
+    if args.file:
+        try:
+            with open(args.file, "r", encoding="utf-8") as f:
+                for line in f:
+                    w = line.strip()
+                    if w and not w.startswith("#"):
+                        words_to_process.append(w)
+        except Exception as e:
+            log(f"Ошибка чтения файла: {e}", "error")
+            return
+    for w in args.words:
+        words_to_process.append(w)
+
+    if not words_to_process:
+        print("Укажите слово или файл со словами (--file).")
         return
 
-    # Проверка на валидность части речи
     valid_pos = {"noun", "verb", "adjective", "adverb", "participle"}
     if args.pos and args.pos not in valid_pos:
-        log(f"Ошибка: '{args.pos}' не является частью речи. Используйте: {', '.join(valid_pos)}", "error")
+        log(f"Ошибка: '{args.pos}' не является частью речи.", "error")
         return
 
-    word = args.words[0]
-    log(f"[1/3] Получаем данные для «{word}» через встроенную библиотеку...")
+    success_count = 0
+    for i, word in enumerate(words_to_process, 1):
+        log(f"\n--- Обработка {i}/{len(words_to_process)}: {word} ---")
+        if process_word(word, args):
+            success_count += 1
     
-    try:
-        card = get_word_data(word, target_pos=args.pos or "", include_blocked=args.include_blocked)
-    except Exception as e:
-        log(f"Ошибка парсинга: {e}", "error")
-        return
-
-    if not card.entries:
-        log("Переводы не найдены.", "error")
-        return
-
-    # ПРИНУДИТЕЛЬНО СТАВИМ POS, ЧТОБЫ БЫЛО "to struggle", а не "the struggle"
-    if args.pos:
-        card.pos = args.pos
-
-    if args.ai:
-        log(f"[2/3] AI (Ollama: {args.ai_model})...")
-        enrich_with_ai(card, args.examples, args.ai_model, args.ai_url, verify=not args.no_verify, ai_only=args.ai_only)
-
-    front, back = build_front_back(card)
-    
-    if args.dry_run:
-        print("=" * 60)
-        print("FRONT:", front)
-        print("-" * 60)
-        print("BACK :", back)
-        print("=" * 60)
-    else:
-        log("[3/3] Отправка в Anki...")
-        try:
-            res = send_to_anki(front, back, args.deck, args.model, [])
-            log(f"✔ Добавлено (ID: {res['result']})")
-        except Exception as e:
-            log(f"✘ Ошибка Anki: {e}", "error")
+    log(f"\nГотово: {success_count} из {len(words_to_process)} обработано.")
 
 if __name__ == "__main__":
     main()

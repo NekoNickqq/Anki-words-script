@@ -36,6 +36,8 @@ AJAX_HEADERS = {
     "Accept-Language": HEADERS["Accept-Language"],
 }
 
+MAX_TOP_FOR_THRESHOLD = 20000  # Потолок для расчета 2% серых слов
+
 @dataclass
 class Example:
     en: str
@@ -57,6 +59,7 @@ class WordCard:
     url: str
     pos: str = ""
     transcription: str = ""
+    word_frequency: Optional[int] = None  # <--- НОВОЕ ПОЛЕ
     entries: list[TranslationEntry] = field(default_factory=list)
 
 _session = None
@@ -83,6 +86,15 @@ def fetch(url: str) -> str:
 
 def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(text)).strip()
+
+def _clean_punctuation(text: str) -> str:
+    """Убирает точку в самом конце, сохраняя ! и ?. Внутренние точки не трогает."""
+    text = text.strip()
+    if text.endswith("."):
+        # Убираем только последнюю точку, если это не многоточие (3 точки)
+        if not text.endswith("..."):
+            text = text[:-1].strip()
+    return text
 
 def _is_noise(text: str) -> bool:
     low = text.lower()
@@ -112,12 +124,11 @@ def _classify_pos(raw: str) -> str:
     return ""
 
 def fetch_all_examples_via_ajax(word: str, target_text: str = "", source_lang: str = "en", target_lang: str = "ru", max_pages: int = 3) -> list[dict]:
-    """Запрашивает примеры для конкретного перевода (target_text)."""
     session = get_session()
     url = f"{BASE_URL}/bst-query-service"
     data = {
         "source_text": word,
-        "target_text": target_text,  # <--- ГЛАВНОЕ ИЗМЕНЕНИЕ: фильтруем по переводу
+        "target_text": target_text,
         "source_lang": source_lang,
         "target_lang": target_lang,
         "npage": 1,
@@ -147,7 +158,6 @@ def get_word_data(word: str, target_pos: str = "", include_blocked: bool = False
     page = fetch(url)
     soup = BeautifulSoup(page, "html.parser")
 
-    # 1. Определяем главную часть речи страницы
     detected_pos = ""
     for btn in soup.select("#pos-filters button"):
         if "no-action" in (btn.get("class") or []): continue
@@ -179,7 +189,6 @@ def get_word_data(word: str, target_pos: str = "", include_blocked: bool = False
     container = soup.select_one("#translations-content")
     if container:
         for node in container.select("a.translation, div.translation"):
-            if "translation-hidden" in (node.get("class") or []): continue
             if node.get("data-posgroup") == "6": continue
             
             term_node = node.select_one(".display-term")
@@ -206,7 +215,6 @@ def get_word_data(word: str, target_pos: str = "", include_blocked: bool = False
                 pos_indexes=[x.strip() for x in node.get("data-pos-index", "").split(",") if x.strip()]
             )
             
-            # Фильтрация по POS
             if target_pos:
                 direct_pos = _classify_pos(ent.part_of_speech)
                 match = (direct_pos == target_pos)
@@ -227,9 +235,8 @@ def get_word_data(word: str, target_pos: str = "", include_blocked: bool = False
     if not entries:
         return WordCard(word=word, url=url, pos=detected_pos, transcription=transcription, entries=[])
 
-    # 4. ТЕПЕРЬ ЗАПРАШИВАЕМ ПРИМЕРЫ ДЛЯ КАЖДОГО ПЕРЕВОДА ОТДЕЛЬНО
+    # Запасной вариант: AJAX для пустых переводов
     for ent in entries:
-        # Сначала пробуем найти в HTML (быстро)
         for ex in soup.select("div.example"):
             if not include_blocked and "blocked" in (ex.get("class") or []): continue
             src = ex.select_one(".src .text")
@@ -239,23 +246,42 @@ def get_word_data(word: str, target_pos: str = "", include_blocked: bool = False
                 if ent.text.lower() in ru.lower():
                     en = _clean(src.get_text())
                     if en and ru and not _is_noise(en):
-                        ent.examples.append(Example(en=en, ru=ru))
-        
-        # Если в HTML не нашли (или нашли мало), идем в AJAX за конкретным переводом
+                        ent.examples.append(Example(en=_clean_punctuation(en), ru=_clean_punctuation(ru)))
+
+    for ent in entries:
         if len(ent.examples) == 0:
             ajax_examples = fetch_all_examples_via_ajax(word, target_text=ent.text)
             for ex_data in ajax_examples:
                 en_raw = ex_data.get("s_text", "")
                 ru_raw = ex_data.get("t_text", "")
                 if not en_raw or not ru_raw: continue
-                
                 en = _clean(BeautifulSoup(en_raw, "html.parser").get_text())
                 ru = _clean(BeautifulSoup(ru_raw, "html.parser").get_text())
-                ent.examples.append(Example(en=en, ru=ru))
+                ent.examples.append(Example(en=_clean_punctuation(en), ru=_clean_punctuation(ru)))
+
+    # Запасной вариант для скрытых переводов
+    still_empty = [e for e in entries if len(e.examples) == 0]
+    if still_empty:
+        all_ajax = fetch_all_examples_via_ajax(word)
+        for ex_data in all_ajax:
+            en_raw = ex_data.get("s_text", "")
+            ru_raw = ex_data.get("t_text", "")
+            if not en_raw or not ru_raw: continue
+            en = _clean(BeautifulSoup(en_raw, "html.parser").get_text())
+            ru = _clean(BeautifulSoup(ru_raw, "html.parser").get_text())
+            ru_low = ru.lower()
+            for ent in still_empty:
+                if len(ent.examples) > 0: continue
+                forms = [ent.text.lower()] + [f.lower() for f in ent.inflected]
+                if any(form and form in ru_low for form in forms):
+                    ent.examples.append(Example(en=_clean_punctuation(en), ru=_clean_punctuation(ru)))
 
     known = [e.frequency for e in entries if e.frequency is not None]
+    word_freq = None
     if known:
-        top = max(known)
+        # ВАЖНО: Ограничиваем top сверху
+        top = min(max(known), MAX_TOP_FOR_THRESHOLD)
+        word_freq = top  # Сохраняем для передачи в anki.py
         threshold = top * 0.02
         filtered = []
         for e in entries:
@@ -264,5 +290,8 @@ def get_word_data(word: str, target_pos: str = "", include_blocked: bool = False
                 if e.frequency <= threshold: e.grey = True
             filtered.append(e)
         entries = filtered
+    else:
+        # Если частот нет, все равно надо что-то сохранить как word_freq
+        pass
 
-    return WordCard(word=word, url=url, pos=detected_pos, transcription=transcription, entries=entries)
+    return WordCard(word=word, url=url, pos=detected_pos, transcription=transcription, word_frequency=word_freq, entries=entries)
