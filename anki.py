@@ -223,7 +223,7 @@ def main():
     ap.add_argument("words", nargs="*")
     ap.add_argument("--file", help="txt файл со словами (по одному в строке)")
     ap.add_argument("--pos", help="Часть речи (noun, verb, adjective...)")
-    ap.add_argument("--deck", default="Reverso EN-RU")
+    ap.add_argument("--deck", default="English")
     ap.add_argument("--model", default="Простая", help="Тип заметки в Anki")
     ap.add_argument("--examples", type=int, default=1)
     ap.add_argument("--include-blocked", action="store_true")
